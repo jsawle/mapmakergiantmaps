@@ -111,8 +111,10 @@
    CONFIG — the only block you normally touch
    ============================================================ */
 const CONFIG = {
-  basemap: "osm",          // initial basemap. "osm" needs no key; the gallery below offers the rest.
-  apiKey: "",              // <-- paste an Esri API key to load the real MapMaker basemaps (Esri-hosted tiles need auth)
+  basemap: "osm",          // bootstrap only: shown for a moment before the group's basemaps load (no key needed)
+  defaultBasemapItemId: "",  // OPTIONAL: paste the Nat Geo basemap's item id here for an instant, guaranteed default
+  defaultBasemapMatch: /national geographic|nat\s*geo/i,  // fallback: auto-pick the group basemap whose title matches this
+  apiKey: "",              // <-- paste an Esri API key if any group basemap's tiles won't draw without auth
   basemapGroupId: "2fdac9fd2eb04f10be1b29ad061a5519",  // MapMaker basemap group -> populates the basemap picker
   start: { lon: 0, lat: 20, zoom: 2 }   // initial framing
 };
@@ -125,8 +127,8 @@ require([
   "esri/core/reactiveUtils",
   "esri/widgets/BasemapGallery",
   "esri/widgets/BasemapGallery/support/PortalBasemapsSource",
-  "esri/widgets/Expand"
-], (esriConfig, Map, MapView, Extent, reactiveUtils, BasemapGallery, PortalBasemapsSource, Expand) => {
+  "esri/Basemap"
+], (esriConfig, Map, MapView, Extent, reactiveUtils, BasemapGallery, PortalBasemapsSource, Basemap) => {
 
   if (CONFIG.apiKey) esriConfig.apiKey = CONFIG.apiKey;
 
@@ -149,6 +151,30 @@ require([
     source: basemapSource,
     container: "galleryHost"
   });
+
+  // ---- Default to the National Geographic basemap (not the bootstrap OSM) ----
+  if (CONFIG.defaultBasemapItemId) {
+    // Explicit + flip-free: load the exact item immediately.
+    const ng = new Basemap({ portalItem: { id: CONFIG.defaultBasemapItemId } });
+    view.map.basemap = ng;
+    ng.when(() => { basemapGallery.activeBasemap = ng; });
+  } else {
+    // No id supplied: once the group's basemaps load, pick the one whose title
+    // matches CONFIG.defaultBasemapMatch. Depends on that title actually containing
+    // "National Geographic" / "Nat Geo"; if it's named oddly this won't match, in
+    // which case set CONFIG.defaultBasemapItemId for a guaranteed default.
+    reactiveUtils.whenOnce(() => basemapSource.basemaps && basemapSource.basemaps.length > 0)
+      .then(() => {
+        const match = basemapSource.basemaps.find(b =>
+          CONFIG.defaultBasemapMatch.test(b.title || "") ||
+          CONFIG.defaultBasemapMatch.test((b.portalItem && b.portalItem.title) || "")
+        );
+        if (match) {
+          view.map.basemap = match;
+          basemapGallery.activeBasemap = match;
+        }
+      });
+  }
 
   // ---- Hidden render view (re-used for every tile) ----
   let renderView = null;
