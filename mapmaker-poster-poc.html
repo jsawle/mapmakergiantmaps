@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MapMaker Poster Tiler — POC</title>
+
+<!-- ArcGIS Maps SDK for JavaScript (loads from Esri CDN; works on GitHub Pages / locally, NOT inside the Claude artifact sandbox) -->
+<link rel="stylesheet" href="https://js.arcgis.com/4.30/esri/themes/light/main.css" />
+<script src="https://js.arcgis.com/4.30/"></script>
+<!-- jsPDF for assembling the multi-page PDF -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+<style>
+  :root { --gap: 14px; --panel: 340px; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #1c1c1c; }
+  #app { display: grid; grid-template-columns: var(--panel) 1fr; height: 100vh; }
+  #panel { padding: 18px; overflow-y: auto; border-right: 1px solid #e3e3e3; background: #fafafa; }
+  #mapWrap { position: relative; }
+  #viewDiv { position: absolute; inset: 0; }
+  h1 { font-size: 17px; margin: 0 0 2px; }
+  .sub { font-size: 12px; color: #666; margin: 0 0 16px; }
+  label { display: block; font-size: 12px; font-weight: 600; margin: 12px 0 4px; }
+  input, select { width: 100%; padding: 7px 8px; font-size: 13px; border: 1px solid #cfcfcf; border-radius: 6px; background: #fff; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  button { width: 100%; margin-top: 18px; padding: 11px; font-size: 14px; font-weight: 600; color: #fff; background: #2b6cb0; border: none; border-radius: 7px; cursor: pointer; }
+  button:disabled { background: #9bb4cc; cursor: default; }
+  #estimate { margin-top: 16px; padding: 12px; background: #fff; border: 1px solid #e3e3e3; border-radius: 7px; font-size: 12.5px; line-height: 1.55; }
+  #estimate b { color: #2b6cb0; }
+  #progress { margin-top: 12px; font-size: 12.5px; color: #444; white-space: pre-line; }
+  #result a { font-size: 13px; }
+  .note { margin-top: 16px; font-size: 11.5px; color: #777; line-height: 1.5; }
+  .swatch { display:inline-block; padding:1px 6px; border-radius:4px; background:#eef3f8; color:#2b6cb0; font-weight:600; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="panel">
+    <h1>Poster Tiler <span class="swatch">POC</span></h1>
+    <p class="sub">Pan / zoom the map to frame the area you want as a wall poster, set the options, then generate a tiled PDF.</p>
+
+    <label>Sheets across (columns)</label>
+    <input id="cols" type="number" min="1" max="20" value="3" />
+
+    <div class="row">
+      <div>
+        <label>Paper size</label>
+        <select id="paper"><option value="A4">A4</option><option value="A3">A3</option></select>
+      </div>
+      <div>
+        <label>Orientation</label>
+        <select id="orient"><option value="portrait">Portrait</option><option value="landscape">Landscape</option></select>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Print DPI</label>
+        <select id="dpi"><option>150</option><option selected>200</option><option>300</option></select>
+      </div>
+      <div>
+        <label>Overlap (mm)</label>
+        <input id="overlap" type="number" min="0" max="40" value="10" />
+      </div>
+    </div>
+
+    <button id="go">Generate poster PDF</button>
+
+    <div id="estimate">Move the map to see the estimate.</div>
+    <div id="progress"></div>
+    <div id="result"></div>
+
+    <p class="note">
+      <b>Basemap:</b> defaults to OpenStreetMap (no key needed) so this runs immediately.
+      For crisp enlargement at poster scale, set <code>CONFIG.apiKey</code> and switch
+      <code>CONFIG.basemap</code> to a vector basemap (e.g. <code>"topo-vector"</code>) near the top of the script —
+      vector re-renders sharp at any size, raster does not.
+    </p>
+  </div>
+
+  <div id="mapWrap"><div id="viewDiv"></div></div>
+</div>
+
+<!-- Off-screen render surface: sized to one sheet's pixel dimensions, used to capture each tile -->
+<div id="renderHost" style="position:absolute; left:-100000px; top:0; opacity:0; pointer-events:none;"></div>
+
+<script>
+/* ============================================================
+   CONFIG — the only block you normally touch
+   ============================================================ */
+const CONFIG = {
+  basemap: "osm",          // out-of-the-box, no auth. For quality: "topo-vector" / "streets-vector" / etc.
+  apiKey: "",              // <-- paste an Esri API key here to use vector basemaps
+  start: { lon: 0, lat: 20, zoom: 2 }   // initial framing
+};
+
+require([
+  "esri/config",
+  "esri/Map",
+  "esri/views/MapView",
+  "esri/geometry/Extent",
+  "esri/core/reactiveUtils"
+], (esriConfig, Map, MapView, Extent, reactiveUtils) => {
+
+  if (CONFIG.apiKey) esriConfig.apiKey = CONFIG.apiKey;
+
+  // ---- Live preview map (what the user frames) ----
+  const previewMap = new Map({ basemap: CONFIG.basemap });
+  const view = new MapView({
+    container: "viewDiv",
+    map: previewMap,
+    center: [CONFIG.start.lon, CONFIG.start.lat],
+    zoom: CONFIG.start.zoom,
+    constraints: { snapToZoom: false }
+  });
+
+  // ---- Hidden render view (re-used for every tile) ----
+  let renderView = null;
+  function buildRenderView(pxW, pxH) {
+    const host = document.getElementById("renderHost");
+    host.innerHTML = '<div id="renderDiv"></div>';
+    const div = document.getElementById("renderDiv");
+    div.style.width = pxW + "px";
+    div.style.height = pxH + "px";
+    const m = new Map({ basemap: CONFIG.basemap });
+    renderView = new MapView({
+      container: "renderDiv",
+      map: m,
+      ui: { components: [] },
+      constraints: { snapToZoom: false }
+    });
+    return renderView.when().then(() => renderView);
+  }
+
+  /* ---------- geometry / layout maths ---------- */
+  const SHEET_MM = { A4: [210, 297], A3: [297, 420] }; // [short, long]
+
+  function sheetMM(paper, orient) {
+    const [s, l] = SHEET_MM[paper];
+    return orient === "portrait" ? { w: s, h: l } : { w: l, h: s };
+  }
+  const pxFromMM = (mm, dpi) => Math.round((mm / 25.4) * dpi);
+
+  // Returns the full layout for the CURRENT view extent + options
+  function computeLayout() {
+    const ext = view.extent; // Web Mercator, metres
+    const cols = Math.max(1, parseInt(document.getElementById("cols").value || "1", 10));
+    const paper = document.getElementById("paper").value;
+    const orient = document.getElementById("orient").value;
+    const dpi = parseInt(document.getElementById("dpi").value, 10);
+    const overlap = Math.max(0, parseFloat(document.getElementById("overlap").value || "0"));
+
+    const sheet = sheetMM(paper, orient);
+    const posterW_m = ext.width;   // metres
+    const posterH_m = ext.height;
+
+    // Scale chosen so `cols` sheets (stepping by sheet-overlap) span the framed width.
+    // S = map-mm per paper-mm.  paper width covered = cols*(w-overlap)+overlap
+    const paperWidthCovered = cols * (sheet.w - overlap) + overlap;
+    const S = (posterW_m * 1000) / paperWidthCovered;
+    const mPerPaperMM = S / 1000;
+
+    const stepX = sheet.w - overlap;
+    const stepY = sheet.h - overlap;
+
+    const rows = Math.max(1, Math.ceil((posterH_m * 1000 / S - overlap) / stepY));
+
+    const physW_mm = cols * stepX + overlap;
+    const physH_mm = rows * stepY + overlap;
+
+    return { ext, cols, rows, paper, orient, dpi, overlap, sheet,
+             S, mPerPaperMM, stepX, stepY, physW_mm, physH_mm,
+             pxW: pxFromMM(sheet.w, dpi), pxH: pxFromMM(sheet.h, dpi) };
+  }
+
+  function tileExtent(L, r, c) {
+    const xmin = L.ext.xmin + c * L.stepX * L.mPerPaperMM;
+    const xmax = xmin + L.sheet.w * L.mPerPaperMM;
+    const ymax = L.ext.ymax - r * L.stepY * L.mPerPaperMM;
+    const ymin = ymax - L.sheet.h * L.mPerPaperMM;
+    return new Extent({ xmin, ymin, xmax, ymax, spatialReference: L.ext.spatialReference });
+  }
+
+  /* ---------- live estimate ---------- */
+  function refreshEstimate() {
+    if (!view.extent) return;
+    const L = computeLayout();
+    const totalSheets = L.cols * L.rows;
+    const finalW_cm = (L.physW_mm / 10).toFixed(0);
+    const finalH_cm = (L.physH_mm / 10).toFixed(0);
+    const scaleTxt = L.S >= 1e6 ? (L.S / 1e6).toFixed(2) + "M" : Math.round(L.S).toLocaleString();
+    document.getElementById("estimate").innerHTML =
+      `Grid: <b>${L.cols} \u00d7 ${L.rows}</b> &nbsp;=&nbsp; <b>${totalSheets} sheets</b><br>` +
+      `Finished size: <b>${finalW_cm} \u00d7 ${finalH_cm} cm</b><br>` +
+      `Map scale: <b>~1:${scaleTxt}</b><br>` +
+      `Each sheet: ${L.pxW} \u00d7 ${L.pxH} px @ ${L.dpi} DPI &nbsp;(${L.paper} ${L.orient})<br>` +
+      `Overlap: ${L.overlap} mm glue margin`;
+  }
+
+  reactiveUtils.watch(() => view.stationary, (s) => { if (s) refreshEstimate(); });
+  ["cols","paper","orient","dpi","overlap"].forEach(id =>
+    document.getElementById(id).addEventListener("input", refreshEstimate));
+  view.when(refreshEstimate);
+
+  /* ---------- tile capture helpers ---------- */
+  const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // Move the hidden view to an extent and wait until tiles have finished drawing.
+  async function captureTile(extent, settleMs = 450, timeoutMs = 20000) {
+    await renderView.goTo(extent, { animate: false });
+    const start = Date.now();
+    while (renderView.updating && (Date.now() - start) < timeoutMs) await delay(100);
+    await delay(settleMs); // extra settle so the last tiles paint
+    const shot = await renderView.takeScreenshot({ format: "jpg", quality: 92 });
+    return shot.dataUrl;
+  }
+
+  /* ---------- PDF assembly ---------- */
+  function drawGuidePage(doc, L) {
+    const total = L.cols * L.rows;
+    doc.setFontSize(20); doc.text("Assembly guide", 18, 24);
+    doc.setFontSize(11);
+    const lines = [
+      `Print all ${total} sheets at 100% / "Actual size" (NOT "fit to page").`,
+      `Lay out as a ${L.cols} \u00d7 ${L.rows} grid using the R#C# labels in each corner.`,
+      `Each sheet overlaps its neighbour by ${L.overlap} mm \u2014 glue along the dashed lines.`,
+      `Finished poster: ${(L.physW_mm/10).toFixed(0)} \u00d7 ${(L.physH_mm/10).toFixed(0)} cm  (scale ~1:${Math.round(L.S).toLocaleString()}).`
+    ];
+    lines.forEach((t, i) => doc.text(t, 18, 36 + i * 7));
+
+    // mini grid
+    const gx = 18, gy = 74, gw = 170, cell = Math.min(24, gw / L.cols);
+    doc.setFontSize(8);
+    for (let r = 0; r < L.rows; r++) {
+      for (let c = 0; c < L.cols; c++) {
+        const x = gx + c * cell, y = gy + r * cell;
+        doc.setDrawColor(150); doc.rect(x, y, cell, cell);
+        doc.text(`R${r+1}C${c+1}`, x + cell/2, y + cell/2 + 1, { align: "center" });
+      }
+    }
+  }
+
+  function decorateSheet(doc, L, r, c) {
+    const { w, h } = L.sheet, o = L.overlap;
+    doc.setDrawColor(40); doc.setLineWidth(0.2);
+    // dashed overlap lines only on edges that meet a neighbour
+    doc.setLineDashPattern([1.4, 1.2], 0);
+    if (c < L.cols - 1) doc.line(w - o, 0, w - o, h);   // right neighbour
+    if (c > 0)          doc.line(o, 0, o, h);            // left neighbour
+    if (r < L.rows - 1) doc.line(0, h - o, w, h - o);    // bottom neighbour
+    if (r > 0)          doc.line(0, o, w, o);            // top neighbour
+    doc.setLineDashPattern([], 0);
+    // corner registration ticks
+    const t = 4;
+    [[0,0],[w,0],[0,h],[w,h]].forEach(([px,py]) => {
+      doc.line(px - (px? t:0), py, px + (px? 0:t), py);
+      doc.line(px, py - (py? t:0), px, py + (py? 0:t));
+    });
+    // label
+    doc.setFontSize(9); doc.setTextColor(30);
+    doc.text(`R${r+1}C${c+1}`, 3, 5);
+  }
+
+  async function generate() {
+    const goBtn = document.getElementById("go");
+    const prog = document.getElementById("progress");
+    const res = document.getElementById("result");
+    res.innerHTML = "";
+    goBtn.disabled = true;
+
+    try {
+      const L = computeLayout();
+      const total = L.cols * L.rows;
+      prog.textContent = `Preparing render surface (${L.pxW}\u00d7${L.pxH}px)\u2026`;
+
+      await buildRenderView(L.pxW, L.pxH);
+
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: L.orient, unit: "mm", format: L.paper.toLowerCase() });
+
+      drawGuidePage(doc, L);
+
+      let n = 0;
+      for (let r = 0; r < L.rows; r++) {
+        for (let c = 0; c < L.cols; c++) {
+          n++;
+          prog.textContent = `Rendering sheet ${n} / ${total}  (R${r+1}C${c+1})\u2026`;
+          const dataUrl = await captureTile(tileExtent(L, r, c));
+          doc.addPage(L.paper.toLowerCase(), L.orient);
+          doc.addImage(dataUrl, "JPEG", 0, 0, L.sheet.w, L.sheet.h);
+          decorateSheet(doc, L, r, c);
+        }
+      }
+
+      prog.textContent = `Done \u2014 ${total} sheets rendered.`;
+      const url = doc.output("bloburl");
+      res.innerHTML = `<a href="${url}" target="_blank">\u2193 Open / download PDF</a>`;
+      doc.save("mapmaker-poster.pdf");
+    } catch (err) {
+      console.error(err);
+      prog.textContent = "Error: " + (err && err.message ? err.message : err) +
+        "\n(Check the console. If the basemap is blank, you likely need an API key for that basemap.)";
+    } finally {
+      goBtn.disabled = false;
+    }
+  }
+
+  document.getElementById("go").addEventListener("click", generate);
+});
+</script>
+</body>
+</html>
