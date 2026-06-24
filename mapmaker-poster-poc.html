@@ -78,10 +78,11 @@
     <div id="result"></div>
 
     <p class="note">
-      <b>Basemap:</b> defaults to OpenStreetMap (no key needed) so this runs immediately.
-      For crisp enlargement at poster scale, set <code>CONFIG.apiKey</code> and switch
-      <code>CONFIG.basemap</code> to a vector basemap (e.g. <code>"topo-vector"</code>) near the top of the script —
-      vector re-renders sharp at any size, raster does not.
+      <b>Choosing a map:</b> use the basemap button (top-right of the map) to pick from the
+      MapMaker basemap group. The thumbnails will list without a key, but the real Esri-hosted
+      basemaps usually need <code>CONFIG.apiKey</code> set to actually draw their tiles.
+      OpenStreetMap is the default and works with no key. Vector basemaps stay sharp at poster
+      scale; raster (incl. OSM) softens when enlarged.
     </p>
   </div>
 
@@ -96,8 +97,9 @@
    CONFIG — the only block you normally touch
    ============================================================ */
 const CONFIG = {
-  basemap: "osm",          // out-of-the-box, no auth. For quality: "topo-vector" / "streets-vector" / etc.
-  apiKey: "",              // <-- paste an Esri API key here to use vector basemaps
+  basemap: "osm",          // initial basemap. "osm" needs no key; the gallery below offers the rest.
+  apiKey: "",              // <-- paste an Esri API key to load the real MapMaker basemaps (Esri-hosted tiles need auth)
+  basemapGroupId: "2fdac9fd2eb04f10be1b29ad061a5519",  // MapMaker basemap group -> populates the basemap picker
   start: { lon: 0, lat: 20, zoom: 2 }   // initial framing
 };
 
@@ -106,8 +108,11 @@ require([
   "esri/Map",
   "esri/views/MapView",
   "esri/geometry/Extent",
-  "esri/core/reactiveUtils"
-], (esriConfig, Map, MapView, Extent, reactiveUtils) => {
+  "esri/core/reactiveUtils",
+  "esri/widgets/BasemapGallery",
+  "esri/widgets/BasemapGallery/support/PortalBasemapsSource",
+  "esri/widgets/Expand"
+], (esriConfig, Map, MapView, Extent, reactiveUtils, BasemapGallery, PortalBasemapsSource, Expand) => {
 
   if (CONFIG.apiKey) esriConfig.apiKey = CONFIG.apiKey;
 
@@ -121,6 +126,21 @@ require([
     constraints: { snapToZoom: false }
   });
 
+  // ---- Basemap picker: lists the basemaps shared to the MapMaker group ----
+  // Note: querying a public group needs no auth, so the thumbnails will list.
+  // Loading Esri-hosted basemap *tiles* generally needs CONFIG.apiKey, though.
+  const basemapSource = new PortalBasemapsSource({
+    query: { id: CONFIG.basemapGroupId }
+  });
+  const basemapGallery = new BasemapGallery({ view, source: basemapSource });
+  const basemapExpand = new Expand({
+    view,
+    content: basemapGallery,
+    expandIcon: "basemap",
+    expandTooltip: "Choose a map"
+  });
+  view.ui.add(basemapExpand, "top-right");
+
   // ---- Hidden render view (re-used for every tile) ----
   let renderView = null;
   function buildRenderView(pxW, pxH) {
@@ -129,7 +149,9 @@ require([
     const div = document.getElementById("renderDiv");
     div.style.width = pxW + "px";
     div.style.height = pxH + "px";
-    const m = new Map({ basemap: CONFIG.basemap });
+    // Render with whatever basemap is currently selected in the preview map,
+    // so the PDF matches what the user picked in the gallery.
+    const m = new Map({ basemap: view.map.basemap.clone() });
     renderView = new MapView({
       container: "renderDiv",
       map: m,
