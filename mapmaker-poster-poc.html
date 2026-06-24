@@ -38,15 +38,26 @@
   #result a { font-size: 13px; }
   .note { margin-top: 16px; font-size: 11.5px; color: #777; line-height: 1.5; }
   .swatch { display:inline-block; padding:1px 6px; border-radius:4px; background:#eef3f8; color:#2b6cb0; font-weight:600; }
+  .gallery-host { max-height: 220px; min-height: 120px; overflow: auto; border: 1px solid #cfcfcf; border-radius: 7px; background: #fff; }
+  .gallery-host .esri-basemap-gallery { border: none; box-shadow: none; }
+  #progressBox { display: none; margin-top: 16px; padding: 14px; border-radius: 8px; background: #eef3f8; border: 1px solid #cfe0f0; }
+  #progressBox.on { display: block; }
+  #progressTitle { font-weight: 700; font-size: 13.5px; color: #1c1c1c; }
+  #progressStats { font-size: 12px; color: #43566b; }
+  .bar { height: 10px; border-radius: 6px; background: #d6e4f0; overflow: hidden; margin: 9px 0 7px; }
+  .bar > i { display: block; height: 100%; width: 0; background: #2b6cb0; transition: width .25s ease; }
 </style>
 </head>
 <body>
 <div id="app">
   <div id="panel">
     <h1>Poster Tiler <span class="swatch">POC</span></h1>
-    <p class="sub">Pan / zoom the map to frame the area you want as a wall poster, set the options, then generate a tiled PDF.</p>
+    <p class="sub">Pick a map, frame the area you want, set the sheet options, then generate a tiled PDF.</p>
 
-    <label>Sheets across (columns)</label>
+    <label>1 &middot; Choose a map</label>
+    <div id="galleryHost" class="gallery-host"></div>
+
+    <label>2 &middot; Sheets across (columns)</label>
     <input id="cols" type="number" min="1" max="20" value="3" />
 
     <div class="row">
@@ -73,16 +84,19 @@
 
     <button id="go">Generate poster PDF</button>
 
-    <div id="estimate">Move the map to see the estimate.</div>
-    <div id="progress"></div>
+    <div id="progressBox">
+      <div id="progressTitle">Working&hellip;</div>
+      <div class="bar"><i id="progressFill"></i></div>
+      <div id="progressStats"></div>
+    </div>
+
     <div id="result"></div>
+    <div id="estimate">Move the map to see the estimate.</div>
 
     <p class="note">
-      <b>Choosing a map:</b> use the basemap button (top-right of the map) to pick from the
-      MapMaker basemap group. The thumbnails will list without a key, but the real Esri-hosted
-      basemaps usually need <code>CONFIG.apiKey</code> set to actually draw their tiles.
-      OpenStreetMap is the default and works with no key. Vector basemaps stay sharp at poster
-      scale; raster (incl. OSM) softens when enlarged.
+      <b>Maps</b> come from the MapMaker basemap group (the picker above). Vector basemaps stay
+      sharp at any poster size; raster softens when enlarged. Rendering happens sheet-by-sheet in
+      your browser, so large grids at high DPI take a while &mdash; the progress bar shows where it's up to.
     </p>
   </div>
 
@@ -126,20 +140,15 @@ require([
     constraints: { snapToZoom: false }
   });
 
-  // ---- Basemap picker: lists the basemaps shared to the MapMaker group ----
-  // Note: querying a public group needs no auth, so the thumbnails will list.
-  // Loading Esri-hosted basemap *tiles* generally needs CONFIG.apiKey, though.
+  // ---- Basemap picker (rendered in the sidebar so it's obvious) ----
   const basemapSource = new PortalBasemapsSource({
     query: { id: CONFIG.basemapGroupId }
   });
-  const basemapGallery = new BasemapGallery({ view, source: basemapSource });
-  const basemapExpand = new Expand({
+  const basemapGallery = new BasemapGallery({
     view,
-    content: basemapGallery,
-    expandIcon: "basemap",
-    expandTooltip: "Choose a map"
+    source: basemapSource,
+    container: "galleryHost"
   });
-  view.ui.add(basemapExpand, "top-right");
 
   // ---- Hidden render view (re-used for every tile) ----
   let renderView = null;
@@ -234,12 +243,25 @@ require([
   /* ---------- tile capture helpers ---------- */
   const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // Move the hidden view to an extent and wait until tiles have finished drawing.
-  async function captureTile(extent, settleMs = 450, timeoutMs = 20000) {
-    await renderView.goTo(extent, { animate: false });
+  // Wait until the view has been *continuously* idle for `stableMs` (a debounce),
+  // not merely idle for a single instant. A hard jump to a new extent makes
+  // view.updating flicker false in the gap between old tiles clearing and new
+  // ones arriving; capturing in that gap is what produced the white holes.
+  // Falls through after `timeoutMs` so one stuck tile can't hang the whole run.
+  async function waitUntilStable(view, stableMs = 1000, timeoutMs = 30000) {
     const start = Date.now();
-    while (renderView.updating && (Date.now() - start) < timeoutMs) await delay(100);
-    await delay(settleMs); // extra settle so the last tiles paint
+    let lastBusy = Date.now();
+    while (true) {
+      if (view.updating) lastBusy = Date.now();
+      if (!view.updating && (Date.now() - lastBusy) >= stableMs) return true;
+      if (Date.now() - start > timeoutMs) return false;
+      await delay(80);
+    }
+  }
+
+  async function captureTile(extent) {
+    await renderView.goTo(extent, { animate: false });
+    await waitUntilStable(renderView);
     const shot = await renderView.takeScreenshot({ format: "jpg", quality: 92 });
     return shot.dataUrl;
   }
@@ -290,47 +312,69 @@ require([
     doc.text(`R${r+1}C${c+1}`, 3, 5);
   }
 
+  function fmt(ms) {
+    const s = Math.round(ms / 1000);
+    const m = Math.floor(s / 60);
+    return m > 0 ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`;
+  }
+
   async function generate() {
     const goBtn = document.getElementById("go");
-    const prog = document.getElementById("progress");
+    const box = document.getElementById("progressBox");
+    const title = document.getElementById("progressTitle");
+    const fill = document.getElementById("progressFill");
+    const stats = document.getElementById("progressStats");
     const res = document.getElementById("result");
     res.innerHTML = "";
     goBtn.disabled = true;
+    goBtn.textContent = "Rendering\u2026";
+    box.classList.add("on");
 
     try {
       const L = computeLayout();
       const total = L.cols * L.rows;
-      prog.textContent = `Preparing render surface (${L.pxW}\u00d7${L.pxH}px)\u2026`;
+      title.textContent = `Preparing render surface (${L.pxW}\u00d7${L.pxH}px)\u2026`;
+      fill.style.width = "0%";
+      stats.textContent = `0 / ${total} sheets`;
 
       await buildRenderView(L.pxW, L.pxH);
 
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({ orientation: L.orient, unit: "mm", format: L.paper.toLowerCase() });
-
       drawGuidePage(doc, L);
 
+      const t0 = Date.now();
       let n = 0;
       for (let r = 0; r < L.rows; r++) {
         for (let c = 0; c < L.cols; c++) {
           n++;
-          prog.textContent = `Rendering sheet ${n} / ${total}  (R${r+1}C${c+1})\u2026`;
+          title.textContent = `Rendering sheet ${n} of ${total}  (R${r + 1}C${c + 1})`;
           const dataUrl = await captureTile(tileExtent(L, r, c));
           doc.addPage(L.paper.toLowerCase(), L.orient);
           doc.addImage(dataUrl, "JPEG", 0, 0, L.sheet.w, L.sheet.h);
           decorateSheet(doc, L, r, c);
+
+          const pct = Math.round((n / total) * 100);
+          fill.style.width = pct + "%";
+          const elapsed = Date.now() - t0;
+          const eta = (elapsed / n) * (total - n);
+          stats.textContent = `${n} / ${total} sheets \u00b7 ${pct}% \u00b7 elapsed ${fmt(elapsed)}` +
+            (n < total ? ` \u00b7 ~${fmt(eta)} left` : "");
         }
       }
 
-      prog.textContent = `Done \u2014 ${total} sheets rendered.`;
+      title.textContent = `Done \u2014 ${total} sheets in ${fmt(Date.now() - t0)}`;
+      fill.style.width = "100%";
       const url = doc.output("bloburl");
       res.innerHTML = `<a href="${url}" target="_blank">\u2193 Open / download PDF</a>`;
       doc.save("mapmaker-poster.pdf");
     } catch (err) {
       console.error(err);
-      prog.textContent = "Error: " + (err && err.message ? err.message : err) +
-        "\n(Check the console. If the basemap is blank, you likely need an API key for that basemap.)";
+      title.textContent = "Error \u2014 see console";
+      stats.textContent = (err && err.message) ? err.message : String(err);
     } finally {
       goBtn.disabled = false;
+      goBtn.textContent = "Generate poster PDF";
     }
   }
 
