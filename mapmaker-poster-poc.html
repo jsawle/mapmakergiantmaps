@@ -5,11 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>MapMaker Poster Tiler — POC</title>
 
+<!-- jsPDF MUST load before the ArcGIS SDK.
+     ArcGIS 4.x uses the Dojo loader, which installs a global AMD define().
+     jsPDF's UMD bundle, if it runs after that, registers itself as an anonymous
+     AMD module and triggers Dojo's "multipleDefine" error, which then breaks
+     require() ("Map is not a constructor"). Loading jsPDF first means define()
+     doesn't exist yet, so jsPDF attaches to window.jspdf with no AMD conflict. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
 <!-- ArcGIS Maps SDK for JavaScript (loads from Esri CDN; works on GitHub Pages / locally, NOT inside the Claude artifact sandbox) -->
 <link rel="stylesheet" href="https://js.arcgis.com/4.30/esri/themes/light/main.css" />
 <script src="https://js.arcgis.com/4.30/"></script>
-<!-- jsPDF for assembling the multi-page PDF -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 
 <style>
   :root { --gap: 14px; --panel: 340px; }
